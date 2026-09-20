@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+import altair as alt
 from supabase import create_client, Client
 from datetime import datetime
 
@@ -17,7 +18,7 @@ with st.sidebar:
     st.header("➕ 新增交易紀錄")
     trade_date = st.date_input("交易日期", datetime.today())
     symbol_raw = st.text_input("股票代碼 (例: 2330 或 NVDA)", "2330")
-    action = st.radio("交易類型", ["BUY (買進)", "SELL (賣出)"])
+    action = st.radio("交易類型", ["買進 (BUY)", "賣出 (SELL)"])
     shares = st.number_input("股數", min_value=1, value=1000, step=1)
     price = st.number_input("成交單價", min_value=0.0, value=100.0, step=0.5)
     fee = st.number_input("手續費/稅", min_value=0, value=0, step=1)
@@ -30,7 +31,7 @@ with st.sidebar:
         data = {
             "trade_date": str(trade_date),
             "symbol": symbol,
-            "action": "BUY" if "BUY" in action else "SELL",
+            "action": "BUY" if "買進" in action else "SELL",
             "shares": shares,
             "price": price,
             "fee": fee
@@ -55,21 +56,40 @@ else:
     with st.sidebar:
         st.markdown("---")
         st.header("🗑️ 刪除交易紀錄")
-        # 建立選項標籤供使用者選擇
         df_trades['delete_label'] = df_trades.apply(
-            lambda r: f"ID:{r['id']} | {r['trade_date'].strftime('%Y-%m-%d')} | {r['symbol']} | {r['action']} {r['shares']}股", axis=1
+            lambda r: f"編號:{r['id']} | {r['trade_date'].strftime('%Y-%m-%d')} | {r['symbol']} | {'買進' if r['action']=='BUY' else '賣出'} {r['shares']}股", axis=1
         )
         selected_to_delete = st.selectbox("選擇要刪除的交易紀錄", df_trades['delete_label'].tolist())
         
         if st.button("確認刪除此筆紀錄", type="secondary"):
-            target_id = int(selected_to_delete.split("|")[0].replace("ID:", "").strip())
+            target_id = int(selected_to_delete.split("|")[0].replace("編號:", "").strip())
             supabase.table("transactions").delete().eq("id", target_id).execute()
             st.success("成功刪除紀錄！")
             st.rerun()
 
+    # 1. 歷史交易明細表格全中文化
     st.subheader("📋 歷史交易明細")
-    st.dataframe(df_trades.drop(columns=['delete_label'], errors='ignore').sort_values(by="trade_date", ascending=False), use_container_width=True)
+    df_display = df_trades.copy()
+    df_display['action'] = df_display['action'].map({'BUY': '買進', 'SELL': '賣出'})
+    df_display['created_at'] = pd.to_datetime(df_display['created_at']).dt.strftime('%Y-%m-%d %H:%M')
+    df_display['trade_date'] = df_display['trade_date'].dt.strftime('%Y-%m-%d')
     
+    # 重命名為繁體中文欄位頭
+    df_display = df_display.rename(columns={
+        'id': '交易編號',
+        'created_at': '建立時間',
+        'trade_date': '交易日期',
+        'symbol': '股票代碼',
+        'action': '交易類型',
+        'shares': '股數',
+        'price': '成交單價',
+        'fee': '手續費/稅'
+    })
+    
+    show_cols = ['交易編號', '交易日期', '股票代碼', '交易類型', '股數', '成交單價', '手續費/稅', '建立時間']
+    st.dataframe(df_display[show_cols].sort_values(by="交易日期", ascending=False), use_container_width=True)
+    
+    # 2. 折線圖與 X 軸時間全中文化 (使用 Altair 繪圖引擎)
     st.subheader("⚔️ 策略總資產 vs 同期 0050 對決曲線")
     min_date = df_trades['trade_date'].min() - pd.Timedelta(days=7)
     unique_symbols = list(set(df_trades['symbol'].tolist() + ['0050.TW']))
@@ -80,7 +100,6 @@ else:
             prices_df = prices_df.to_frame()
             
     if not prices_df.empty:
-        # 向前填補假日缺值 (ffill)
         prices_df = prices_df.ffill().bfill()
         
         daily_portfolio = []
@@ -96,14 +115,11 @@ else:
                 sym = row['symbol']
                 sign = 1 if row['action'] == 'BUY' else -1
                 
-                # 計算個股當日市值
                 if sym in prices_df.columns and not pd.isna(prices_df.loc[curr_date, sym]):
                     real_val += sign * row['shares'] * prices_df.loc[curr_date, sym]
                 
-                # 計算 0050 同期對照組
                 if '0050.TW' in prices_df.columns:
                     trade_cost = row['shares'] * row['price']
-                    # 尋找交易日或當日最接近的 0050 價格
                     t_date = row['trade_date']
                     if t_date in prices_df.index:
                         p_0050 = prices_df.loc[t_date, '0050.TW']
@@ -116,10 +132,21 @@ else:
             bm_val = bm_shares * prices_df.loc[curr_date, '0050.TW'] if '0050.TW' in prices_df.columns else 0
             
             daily_portfolio.append({
-                "Date": curr_date,
+                "日期": curr_date,
                 "你的投資組合市值": max(0, real_val),
                 "0050 對照組市值": max(0, bm_val)
             })
             
-        chart_df = pd.DataFrame(daily_portfolio).set_index("Date")
-        st.line_chart(chart_df)
+        chart_df = pd.DataFrame(daily_portfolio)
+        chart_melted = chart_df.melt(id_vars=['日期'], var_name='項目', value_name='市值(元)')
+        
+        # 繪製繁體中文時間格式 (X 軸格式設定為中文日期月/日)
+        chart = alt.Chart(chart_melted).mark_line().encode(
+            x=alt.X('日期:T', title='日期', axis=alt.Axis(format='%m月%d日', labelAngle=0)),
+            y=alt.Y('市值(元):Q', title='總市值 (NTD)'),
+            color=alt.Color('項目:N', title='類別')
+        ).properties(
+            height=400
+        ).interactive()
+        
+        st.altair_chart(chart, use_container_width=True)
